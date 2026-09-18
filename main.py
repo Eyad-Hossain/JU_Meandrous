@@ -3,7 +3,7 @@ import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-import pulp
+import scheduler
 from openai import OpenAI
 
 # 1. INITIALIZATION
@@ -53,90 +53,7 @@ class DirectiveInterpretation(BaseModel):
     explanation: str
 
 # 3. THE OPTIMIZER LOGIC
-
-
-def solve_optimization(request: OptimizeRequest, directives: List[DirectiveInterpretation]):
-    model = pulp.LpProblem("GridWise", pulp.LpMinimize)
-
-    grid = [pulp.LpVariable(f"g_{i}", lowBound=0) for i in range(24)]
-    charge = [pulp.LpVariable(f"c_{i}", lowBound=0) for i in range(24)]
-    discharge = [pulp.LpVariable(f"d_{i}", lowBound=0) for i in range(24)]
-    batt = [pulp.LpVariable(
-        f"b_{i}", lowBound=0, upBound=request.battery.capacity_kwh) for i in range(24)]
-    solar_used = [pulp.LpVariable(f"s_{i}", lowBound=0) for i in range(24)]
-
-    model += pulp.lpSum([grid[i] *
-                        request.hours[i].tariff_bdt_per_kwh for i in range(24)])
-
-    for i in range(24):
-        effective_solar = request.hours[i].solar_kwh
-        min_reserve = request.battery.minimum_energy_kwh
-        max_grid = None
-
-        for d in directives:
-            if d.applies and d.structured_adjustment and d.structured_adjustment.hours is not None:
-                if i in d.structured_adjustment.hours:
-                    if d.directive_type == "solar_reduction" and d.structured_adjustment.factor is not None:
-                        effective_solar *= d.structured_adjustment.factor
-                    elif d.directive_type == "minimum_battery_reserve" and d.structured_adjustment.minimum_energy_kwh is not None:
-                        min_reserve = max(
-                            min_reserve, d.structured_adjustment.minimum_energy_kwh)
-                    elif d.directive_type == "no_charge_window":
-                        model += charge[i] == 0
-                    elif d.directive_type == "no_discharge_window":
-                        model += discharge[i] == 0
-                    elif d.directive_type == "max_grid_window" and d.structured_adjustment.max_grid_kwh is not None:
-                        if max_grid is None:
-                            max_grid = d.structured_adjustment.max_grid_kwh
-                        else:
-                            max_grid = min(
-                                max_grid, d.structured_adjustment.max_grid_kwh)
-
-        model += solar_used[i] <= effective_solar
-        model += grid[i] + solar_used[i] + \
-            discharge[i] == request.hours[i].demand_kwh + charge[i]
-        model += charge[i] <= request.battery.max_charge_kwh_per_hour
-        model += discharge[i] <= request.battery.max_discharge_kwh_per_hour
-        model += batt[i] >= min_reserve
-
-        if max_grid is not None:
-            model += grid[i] <= max_grid
-
-        if i == 0:
-            model += batt[i] == request.battery.initial_energy_kwh + \
-                charge[i] - discharge[i]
-        else:
-            model += batt[i] == batt[i-1] + charge[i] - discharge[i]
-
-    model += batt[23] == request.battery.initial_energy_kwh
-
-    model.solve(pulp.PULP_CBC_CMD(msg=False))
-
-    plan = []
-    for i in range(24):
-        c_val = charge[i].varValue or 0.0
-        d_val = discharge[i].varValue or 0.0
-        action = "idle"
-        kwh = 0.0
-        if c_val > 0.001:
-            action = "charge"
-            kwh = c_val
-        elif d_val > 0.001:
-            action = "discharge"
-            kwh = d_val
-
-        plan.append({
-            "hour": i,
-            "grid_kwh": round(grid[i].varValue or 0.0, 4),
-            "solar_used_kwh": round(solar_used[i].varValue or 0.0, 4),
-            "battery_action": action,
-            "battery_kwh": round(kwh, 4),
-            "battery_energy_after_kwh": round(batt[i].varValue or 0.0, 4)
-        })
-
-    total_cost = round(pulp.value(model.objective), 2)
-    peak_grid = round(max((g.varValue or 0.0) for g in grid), 2)
-    return plan, total_cost, peak_grid
+# Optimization lives in scheduler.solve(); main.py only shapes data and calls it.
 
 # 4. API ENDPOINTS
 
@@ -189,7 +106,48 @@ def optimize_energy(request: OptimizeRequest):
         raise HTTPException(
             status_code=500, detail=f"LLM Interpretation failed: {str(e)}")
 
-    plan, total_cost, peak = solve_optimization(request, valid_directives)
+    # --- Translate LLM interpretations into the scheduler's expected shape --
+    # scheduler.solve() expects: [{"type": "...", "structured_adjustment": {...}}]
+    directives_for_solver = []
+    for item in valid_directives:
+        if not item.applies:
+            continue
+        adj = item.structured_adjustment
+        adj_dict = adj.model_dump() if hasattr(
+            adj, "model_dump") else (adj.dict() if adj else {})
+        directives_for_solver.append({
+            "type": item.directive_type,
+            "structured_adjustment": adj_dict,
+        })
+
+    # --- Pydantic -> plain dicts for the scheduler -------------------------
+    hours_dict = [h.model_dump() if hasattr(
+        h, "model_dump") else h.dict() for h in request.hours]
+    battery_dict = (request.battery.model_dump() if hasattr(
+        request.battery, "model_dump") else request.battery.dict())
+
+    # --- Solve -------------------------------------------------------------
+    try:
+        hourly_plan = scheduler.solve(
+            hours=hours_dict,
+            battery=battery_dict,
+            directives=directives_for_solver,
+        )
+    except Exception as e:
+        # Safe failure requirement: never 500 on solver issues —
+        # return a structured error payload instead.
+        return {"error": "Solver failed", "details": str(e)}, 500
+
+    # --- Summary stats -----------------------------------------------------
+    total_grid_kwh = round(sum(h["grid_kwh"] for h in hourly_plan), 2)
+    peak_grid_kwh = round(max(h["grid_kwh"] for h in hourly_plan), 2)
+    total_cost_bdt = round(
+        sum(
+            plan_h["grid_kwh"] * req_h["tariff_bdt_per_kwh"]
+            for plan_h, req_h in zip(hourly_plan, hours_dict)
+        ),
+        2,
+    )
 
     serialized_directives = [d.model_dump() if hasattr(
         d, 'model_dump') else d.dict() for d in valid_directives]
@@ -197,9 +155,9 @@ def optimize_energy(request: OptimizeRequest):
     return {
         "scenario_id": request.scenario_id,
         "directive_interpretation": serialized_directives,
-        "hourly_plan": plan,
-        "total_grid_kwh": round(sum(h['grid_kwh'] for h in plan), 2),
-        "total_cost_bdt": total_cost,
-        "peak_grid_kwh": peak,
+        "hourly_plan": hourly_plan,
+        "total_grid_kwh": total_grid_kwh,
+        "total_cost_bdt": total_cost_bdt,
+        "peak_grid_kwh": peak_grid_kwh,
         "plan_summary": "Processed schedule via LLM and PuLP optimizer."
     }
