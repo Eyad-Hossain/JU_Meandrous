@@ -9,7 +9,7 @@ with open('BUP_CSE_FEST_2026_Preli_Public_Sample_Cases.json', 'r', encoding='utf
 test_input = data['cases'][0]['input']
 
 print("Sending request to local API...")
-response = requests.post('http://127.0.0.1:8000/optimize-energy', json=test_input)
+response = requests.post('https://ju-meandrous.onrender.com/optimize-energy', json=test_input)
 
 # Print the result
 if response.status_code == 200:
