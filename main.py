@@ -8,12 +8,20 @@ from openai import OpenAI
 
 # 1. INITIALIZATION
 app = FastAPI()
-client = OpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1"
-)
 
-# 2. DATA MODELS
+# Lazy client initialization - allows health check without API key
+_client = None
+def get_client():
+    global _client
+    if _client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=503, detail="GROQ_API_KEY not configured")
+        _client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1"
+        )
+    return _client
 
 
 class HourData(BaseModel):
@@ -90,6 +98,7 @@ def optimize_energy(request: OptimizeRequest):
     """
 
     try:
+        client = get_client()
         response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
             messages=[{"role": "system", "content": prompt}],
